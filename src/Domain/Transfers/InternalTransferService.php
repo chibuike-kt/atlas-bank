@@ -6,6 +6,8 @@ namespace App\Domain\Transfers;
 
 use App\Infrastructure\Db\Connection;
 use Ramsey\Uuid\Uuid;
+use App\Domain\Transfers\TransferEventWriter;
+
 
 final class InternalTransferService
 {
@@ -148,12 +150,13 @@ final class InternalTransferService
   ): array {
     $pdo = Connection::pdo($this->config['db']);
 
-    // Reference should be stable; later we’ll use idempotency key ref.
     $reference = 'internal_' . bin2hex(random_bytes(12));
+    $transferId = Uuid::uuid4()->toString();
 
+    // We create the transfer row early as pending so we can mark failed if needed.
     $pdo->beginTransaction();
     try {
-      // 1) Resolve recipient user
+      // Resolve recipient user (no locks needed yet)
       $stmt = $pdo->prepare("SELECT id FROM users WHERE email = ? LIMIT 1");
       $stmt->execute([$recipientEmail]);
       $recipient = $stmt->fetch();
@@ -162,54 +165,30 @@ final class InternalTransferService
 
       if ($recipientUserId === $senderUserId) throw new \DomainException('cannot_transfer_to_self');
 
-      // 2) Lock sender account row (prevents double spend)
-      $stmt = $pdo->prepare("SELECT id, balance_minor FROM accounts WHERE user_id = ? AND currency = ? LIMIT 1 FOR UPDATE");
+      // Lock accounts (consistent ordering to avoid deadlocks)
+      $stmt = $pdo->prepare("SELECT id FROM accounts WHERE user_id = ? AND currency = ? LIMIT 1");
       $stmt->execute([$senderUserId, $currency]);
-      $senderAcct = $stmt->fetch();
-      if (!$senderAcct) throw new \DomainException('sender_account_not_found');
+      $s = $stmt->fetch();
+      if (!$s) throw new \DomainException('sender_account_not_found');
+      $senderAccountId = (string)$s['id'];
 
-      $senderAccountId = (string)$senderAcct['id'];
-      $senderBalance = (int)$senderAcct['balance_minor'];
-
-      if ($senderBalance < $amountMinor) throw new \DomainException('insufficient_funds');
-
-      // 3) Lock recipient account row
-      $stmt = $pdo->prepare("SELECT id, balance_minor FROM accounts WHERE user_id = ? AND currency = ? LIMIT 1 FOR UPDATE");
+      $stmt = $pdo->prepare("SELECT id FROM accounts WHERE user_id = ? AND currency = ? LIMIT 1");
       $stmt->execute([$recipientUserId, $currency]);
-      $recipientAcct = $stmt->fetch();
-      if (!$recipientAcct) throw new \DomainException('recipient_account_not_found');
+      $r = $stmt->fetch();
+      if (!$r) throw new \DomainException('recipient_account_not_found');
+      $recipientAccountId = (string)$r['id'];
 
-      $recipientAccountId = (string)$recipientAcct['id'];
-
-      // 4) Create journal
+      // Create journal in pending state initially (optional but clean)
       $journalId = Uuid::uuid4()->toString();
-      $stmt = $pdo->prepare("INSERT INTO journals (id, type, reference, status) VALUES (?, 'internal_transfer', ?, 'posted')");
+      $stmt = $pdo->prepare("INSERT INTO journals (id, type, reference, status) VALUES (?, 'internal_transfer', ?, 'pending')");
       $stmt->execute([$journalId, $reference]);
 
-      // 5) Create postings (double-entry)
-      // sender: debit (money leaves)
-      $stmt = $pdo->prepare("INSERT INTO postings (id, journal_id, account_id, direction, amount_minor, currency) VALUES (?, ?, ?, 'debit', ?, ?)");
-      $stmt->execute([Uuid::uuid4()->toString(), $journalId, $senderAccountId, $amountMinor, $currency]);
-
-      // recipient: credit (money enters)
-      $stmt = $pdo->prepare("INSERT INTO postings (id, journal_id, account_id, direction, amount_minor, currency) VALUES (?, ?, ?, 'credit', ?, ?)");
-      $stmt->execute([Uuid::uuid4()->toString(), $journalId, $recipientAccountId, $amountMinor, $currency]);
-
-      // 6) Update balances atomically (still inside row lock)
-      $stmt = $pdo->prepare("UPDATE accounts SET balance_minor = balance_minor - ? WHERE id = ?");
-      $stmt->execute([$amountMinor, $senderAccountId]);
-
-      $stmt = $pdo->prepare("UPDATE accounts SET balance_minor = balance_minor + ? WHERE id = ?");
-      $stmt->execute([$amountMinor, $recipientAccountId]);
-
-      // 7) Transfer record
-      $transferId = Uuid::uuid4()->toString();
+      // Create transfer as pending
       $stmt = $pdo->prepare("
-  INSERT INTO transfers
-    (id, journal_id, sender_user_id, sender_account_id, recipient_user_id, recipient_account_id, amount_minor, currency, memo, status)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'posted')
-");
-
+      INSERT INTO transfers
+        (id, journal_id, sender_user_id, sender_account_id, recipient_user_id, recipient_account_id, amount_minor, currency, memo, status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+    ");
       $stmt->execute([
         $transferId,
         $journalId,
@@ -222,10 +201,61 @@ final class InternalTransferService
         $memo !== '' ? $memo : null
       ]);
 
-      // 8) Audit (append-only)
+      TransferEventWriter::record($pdo, $transferId, $senderUserId, null, 'pending', null, [
+        'reference' => $reference,
+        'amount_minor' => $amountMinor,
+        'currency' => $currency,
+        'recipient_user_id' => $recipientUserId
+      ]);
+
+      // Now lock both accounts FOR UPDATE in deterministic order
+      $a1 = $senderAccountId < $recipientAccountId ? $senderAccountId : $recipientAccountId;
+      $a2 = $senderAccountId < $recipientAccountId ? $recipientAccountId : $senderAccountId;
+
+      $stmt = $pdo->prepare("SELECT id, balance_minor FROM accounts WHERE id IN (?, ?) FOR UPDATE");
+      $stmt->execute([$a1, $a2]);
+      $rows = $stmt->fetchAll();
+      if (count($rows) !== 2) throw new \DomainException('account_not_found');
+
+      // Re-fetch sender balance under lock
+      $stmt = $pdo->prepare("SELECT balance_minor FROM accounts WHERE id = ? LIMIT 1");
+      $stmt->execute([$senderAccountId]);
+      $sb = $stmt->fetch();
+      if (!$sb) throw new \DomainException('sender_account_not_found');
+      $senderBalance = (int)$sb['balance_minor'];
+
+      if ($senderBalance < $amountMinor) throw new \DomainException('insufficient_funds');
+
+      // Post double-entry postings
+      $stmt = $pdo->prepare("INSERT INTO postings (id, journal_id, account_id, direction, amount_minor, currency) VALUES (?, ?, ?, 'debit', ?, ?)");
+      $stmt->execute([Uuid::uuid4()->toString(), $journalId, $senderAccountId, $amountMinor, $currency]);
+
+      $stmt = $pdo->prepare("INSERT INTO postings (id, journal_id, account_id, direction, amount_minor, currency) VALUES (?, ?, ?, 'credit', ?, ?)");
+      $stmt->execute([Uuid::uuid4()->toString(), $journalId, $recipientAccountId, $amountMinor, $currency]);
+
+      // Update balances
+      $stmt = $pdo->prepare("UPDATE accounts SET balance_minor = balance_minor - ? WHERE id = ?");
+      $stmt->execute([$amountMinor, $senderAccountId]);
+
+      $stmt = $pdo->prepare("UPDATE accounts SET balance_minor = balance_minor + ? WHERE id = ?");
+      $stmt->execute([$amountMinor, $recipientAccountId]);
+
+      // Mark journal posted
+      $stmt = $pdo->prepare("UPDATE journals SET status = 'posted' WHERE id = ?");
+      $stmt->execute([$journalId]);
+
+      // Mark transfer posted
+      $stmt = $pdo->prepare("UPDATE transfers SET status = 'posted', failure_reason = NULL WHERE id = ?");
+      $stmt->execute([$transferId]);
+
+      TransferEventWriter::record($pdo, $transferId, $senderUserId, 'pending', 'posted', null, [
+        'journal_id' => $journalId
+      ]);
+
+      // Audit
       $stmt = $pdo->prepare("INSERT INTO audit_logs (id, actor_user_id, action, meta_json) VALUES (?, ?, 'internal_transfer_posted', JSON_OBJECT(
-        'transfer_id', ?, 'journal_id', ?, 'reference', ?, 'amount_minor', ?, 'currency', ?, 'recipient_user_id', ?
-      ))");
+      'transfer_id', ?, 'journal_id', ?, 'reference', ?, 'amount_minor', ?, 'currency', ?, 'recipient_user_id', ?
+    ))");
       $stmt->execute([
         Uuid::uuid4()->toString(),
         $senderUserId,
@@ -245,9 +275,40 @@ final class InternalTransferService
         'reference' => $reference,
         'amount_minor' => $amountMinor,
         'currency' => $currency,
+        'status' => 'posted'
       ];
+    } catch (\DomainException $e) {
+      if ($pdo->inTransaction()) {
+        // Best-effort mark failed if transfer exists
+        try {
+          $stmt = $pdo->prepare("UPDATE transfers SET status = 'failed', failure_reason = ? WHERE id = ?");
+          $stmt->execute([$e->getMessage(), $transferId]);
+
+          TransferEventWriter::record($pdo, $transferId, $senderUserId, 'pending', 'failed', $e->getMessage(), [
+            'reference' => $reference
+          ]);
+
+          // Mark journal failed if present
+          $stmt = $pdo->prepare("UPDATE journals SET status = 'reversed' WHERE reference = ? AND type='internal_transfer'");
+          $stmt->execute([$reference]);
+        } catch (\Throwable $ignore) {
+        }
+        $pdo->rollBack();
+      }
+      throw $e;
     } catch (\Throwable $e) {
-      if ($pdo->inTransaction()) $pdo->rollBack();
+      if ($pdo->inTransaction()) {
+        try {
+          $stmt = $pdo->prepare("UPDATE transfers SET status = 'failed', failure_reason = 'internal_error' WHERE id = ?");
+          $stmt->execute([$transferId]);
+
+          TransferEventWriter::record($pdo, $transferId, $senderUserId, 'pending', 'failed', 'internal_error', [
+            'reference' => $reference
+          ]);
+        } catch (\Throwable $ignore) {
+        }
+        $pdo->rollBack();
+      }
       throw $e;
     }
   }
