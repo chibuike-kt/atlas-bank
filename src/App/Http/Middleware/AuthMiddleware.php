@@ -12,6 +12,16 @@ final class AuthMiddleware
 {
   public function __construct(private array $config) {}
 
+  $public = [
+  'GET /health',
+  'POST /auth/register',
+  'POST /auth/login',
+];
+if (in_array($req->method . ' ' . $req->path, $public, true)) {
+  return $next($req, $res);
+}
+
+
   public function handle(Request $req, Response $res, callable $next): Response
   {
     $auth = $req->header('authorization') ?? '';
