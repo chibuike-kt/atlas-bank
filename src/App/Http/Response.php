@@ -8,7 +8,7 @@ final class Response
 {
   private int $status = 200;
   private array $headers = ['content-type' => 'application/json; charset=utf-8'];
-  private mixed $payload = null;
+  private array $payload = ['ok' => true];
 
   public function status(int $code): self
   {
@@ -23,10 +23,19 @@ final class Response
     return $this;
   }
 
+  public function getStatusCode(): int
+  {
+    return $this->status;
+  }
+  public function getPayload(): array
+  {
+    return $this->payload;
+  }
+
   public function send(): void
   {
     http_response_code($this->status);
     foreach ($this->headers as $k => $v) header($k . ': ' . $v);
-    echo json_encode($this->payload ?? ['ok' => true], JSON_UNESCAPED_SLASHES);
+    echo json_encode($this->payload, JSON_UNESCAPED_SLASHES);
   }
 }

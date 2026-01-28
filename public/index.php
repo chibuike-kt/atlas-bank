@@ -29,9 +29,15 @@ $router = new Router();
 
 /** Routes */
 $router->get('/health', [HealthController::class, 'handle']);
+
 $router->post('/auth/register', [AuthController::class, 'register']);
+
 $router->post('/auth/login', [AuthController::class, 'login']);
+
 $router->post('/transfers/internal', [TransferController::class, 'internal']);
+
+$router->post('/transfers/{id}/reverse', [TransferController::class, 'reverse']);
+
 
 /** Global middleware */
 $stack = new MiddlewareStack([
