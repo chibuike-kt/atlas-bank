@@ -21,18 +21,18 @@ final class InternalTransferService
         SELECT
           t.id AS transfer_id,
           t.journal_id AS original_journal_id,
+          t.status AS transfer_status,
           t.sender_user_id,
           t.sender_account_id,
           t.recipient_user_id,
           t.recipient_account_id,
           t.amount_minor,
-          t.currency,
-          j.status AS journal_status
+          t.currency
         FROM transfers t
-        JOIN journals j ON j.id = t.journal_id
         WHERE t.id = ?
         LIMIT 1
         FOR UPDATE
+
       ");
       $stmt->execute([$transferId]);
       $t = $stmt->fetch();
@@ -40,8 +40,8 @@ final class InternalTransferService
       if (!$t) throw new \DomainException('transfer_not_found');
       if ((string)$t['sender_user_id'] !== $requestingUserId) throw new \DomainException('not_allowed');
 
-      if ((string)$t['journal_status'] === 'reversed') throw new \DomainException('already_reversed');
-      if ((string)$t['journal_status'] !== 'posted') throw new \DomainException('not_reversible');
+      if ((string)$t['transfer_status'] === 'reversed') throw new \DomainException('already_reversed');
+      if ((string)$t['transfer_status'] !== 'posted') throw new \DomainException('not_reversible');
 
       $amount = (int)$t['amount_minor'];
       $currency = (string)$t['currency'];
@@ -93,6 +93,17 @@ final class InternalTransferService
       // Mark original journal reversed (immutability: we don't delete postings)
       $stmt = $pdo->prepare("UPDATE journals SET status = 'reversed' WHERE id = ?");
       $stmt->execute([$originalJournalId]);
+
+      // Mark transfer reversed + link reversal journal
+      $stmt = $pdo->prepare("
+  UPDATE transfers
+  SET status = 'reversed',
+      reversal_journal_id = ?,
+      reversed_at = CURRENT_TIMESTAMP
+  WHERE id = ?
+");
+      $stmt->execute([$reversalJournalId, $transferId]);
+
 
       // Audit
       $stmt = $pdo->prepare("INSERT INTO audit_logs (id, actor_user_id, action, meta_json) VALUES (?, ?, 'internal_transfer_reversed', JSON_OBJECT(
@@ -194,10 +205,11 @@ final class InternalTransferService
       // 7) Transfer record
       $transferId = Uuid::uuid4()->toString();
       $stmt = $pdo->prepare("
-        INSERT INTO transfers
-          (id, journal_id, sender_user_id, sender_account_id, recipient_user_id, recipient_account_id, amount_minor, currency, memo)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ");
+  INSERT INTO transfers
+    (id, journal_id, sender_user_id, sender_account_id, recipient_user_id, recipient_account_id, amount_minor, currency, memo, status)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'posted')
+");
+
       $stmt->execute([
         $transferId,
         $journalId,
