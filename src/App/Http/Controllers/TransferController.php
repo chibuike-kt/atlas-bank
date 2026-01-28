@@ -12,7 +12,7 @@ final class TransferController
 {
   public function __construct(private array $config) {}
 
-  public function internal(Request $req, Response $res): Response
+  public function internal(Request $req, Response $res, array $params = []): Response
   {
     $userId = (string)($req->headers['x-auth-sub'] ?? '');
     if ($userId === '') return $res->json(['error' => 'auth_required'], 401);
@@ -39,6 +39,28 @@ final class TransferController
 
     try {
       $result = $svc->transfer($userId, $recipientEmail, $amountMinor, $currency, $memo);
+      return $res->json(['ok' => true] + $result, 201);
+    } catch (\DomainException $e) {
+      return $res->json(['error' => $e->getMessage()], 409);
+    } catch (\Throwable $e) {
+      return $res->json(['error' => 'internal_error'], 500);
+    }
+  }
+
+  public function reverse(Request $req, Response $res, array $params): Response
+  {
+    $userId = (string)($req->headers['x-auth-sub'] ?? '');
+    if ($userId === '') return $res->json(['error' => 'auth_required'], 401);
+
+    $transferId = (string)($params['id'] ?? '');
+    if (!preg_match('/^[0-9a-fA-F-]{36}$/', $transferId)) {
+      return $res->json(['error' => 'invalid_transfer_id'], 422);
+    }
+
+    $svc = new InternalTransferService($this->config);
+
+    try {
+      $result = $svc->reverse($userId, $transferId);
       return $res->json(['ok' => true] + $result, 201);
     } catch (\DomainException $e) {
       return $res->json(['error' => $e->getMessage()], 409);
