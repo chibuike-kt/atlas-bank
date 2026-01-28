@@ -23,6 +23,7 @@ final class TransferEventWriter
         (id, transfer_id, actor_user_id, from_status, to_status, reason, meta_json)
       VALUES (?, ?, ?, ?, ?, ?, ?)
     ");
+
     $stmt->execute([
       Uuid::uuid4()->toString(),
       $transferId,
