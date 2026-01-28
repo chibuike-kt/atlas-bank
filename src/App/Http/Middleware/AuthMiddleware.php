@@ -10,20 +10,21 @@ use App\App\Security\JwtVerify;
 
 final class AuthMiddleware
 {
-  public function __construct(private array $config) {}
 
-  $public = [
-  'GET /health',
-  'POST /auth/register',
-  'POST /auth/login',
-];
-if (in_array($req->method . ' ' . $req->path, $public, true)) {
-  return $next($req, $res);
-}
+  public function __construct(private array $config) {}
 
 
   public function handle(Request $req, Response $res, callable $next): Response
   {
+    $public = [
+      'GET /health',
+      'POST /auth/register',
+      'POST /auth/login',
+    ];
+    if (in_array($req->method . ' ' . $req->path, $public, true)) {
+      return $next($req, $res);
+    }
+
     $auth = $req->header('authorization') ?? '';
     if (!preg_match('/^Bearer\s+(.+)$/i', $auth, $m)) {
       return $res->json(['error' => 'missing_auth'], 401);
